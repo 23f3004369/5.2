@@ -7,6 +7,8 @@ import base64
 import os
 import re
 import shlex
+from typing import Any, Dict, List
+import json
 
 app = FastAPI()
 
@@ -359,3 +361,130 @@ def scan(req: SkillRequest):
                 break
 
     return {"categories": categories}
+
+class Step(BaseModel):
+    step_number: int
+    tool: str
+    args: Dict[str, Any]
+    tokens_used: int
+
+
+class RunRequest(BaseModel):
+    budget_tokens: int
+    steps: List[Step]
+
+
+def normalize(obj):
+    """
+    Canonicalize arguments:
+    - Remove client_ts
+    - Sort object keys
+    - Collapse whitespace inside strings
+    """
+
+    if isinstance(obj, dict):
+        return {
+            k: normalize(v)
+            for k, v in sorted(obj.items())
+            if k != "client_ts"
+        }
+
+    if isinstance(obj, list):
+        return [normalize(x) for x in obj]
+
+    if isinstance(obj, str):
+        return re.sub(r"\s+", " ", obj).strip()
+
+    return obj
+
+
+def canonical_args(args):
+    return json.dumps(normalize(args), sort_keys=True, separators=(",", ":"))
+
+
+def halt(reason):
+    return {
+        "decision": "halt",
+        "reason": reason,
+    }
+
+
+def cont(reason):
+    return {
+        "decision": "continue",
+        "reason": reason,
+    }
+
+
+@app.post("/run_guard")
+def run_guard(req: RunRequest):
+
+    ####################################################
+    # Budget
+    ####################################################
+
+    total = sum(step.tokens_used for step in req.steps)
+
+    if total >= req.budget_tokens:
+        return halt(
+            f"Cumulative tokens_used ({total}) has reached the budget ({req.budget_tokens})."
+        )
+
+    ####################################################
+    # Triple identical call
+    ####################################################
+
+    streak = 1
+
+    for i in range(1, len(req.steps)):
+
+        prev = req.steps[i - 1]
+        curr = req.steps[i]
+
+        same = (
+            prev.tool == curr.tool
+            and canonical_args(prev.args) == canonical_args(curr.args)
+        )
+
+        if same:
+            streak += 1
+
+            if streak >= 3:
+                return halt("Detected repeated identical tool call loop.")
+
+        else:
+            streak = 1
+
+    ####################################################
+    # Alternating A B A B A B
+    ####################################################
+
+    if len(req.steps) >= 6:
+
+        last = req.steps[-6:]
+
+        ids = [
+            (
+                s.tool,
+                canonical_args(s.args),
+            )
+            for s in last
+        ]
+
+        A = ids[0]
+        B = ids[1]
+
+        if (
+            A != B
+            and ids[2] == A
+            and ids[3] == B
+            and ids[4] == A
+            and ids[5] == B
+        ):
+            return halt("Detected alternating two-step loop.")
+
+    ####################################################
+    # Otherwise
+    ####################################################
+
+    return cont("Budget available and no loop detected.")
