@@ -246,3 +246,116 @@ def check(req: ToolRequest):
         return check_http(req.url)
 
     return block("Unknown tool.")
+
+class SkillRequest(BaseModel):
+    skill: str
+
+
+@app.post("/scan")
+def scan(req: SkillRequest):
+
+    skill = req.skill
+    categories = []
+
+    lower = skill.lower()
+
+    ####################################################
+    # hardcoded_secret
+    ####################################################
+
+    secret_patterns = [
+        r"sk-[A-Za-z0-9_\-]{10,}",
+        r"ghp_[A-Za-z0-9]{20,}",
+        r"AIza[0-9A-Za-z_\-]{20,}",
+        r"xox[baprs]-[A-Za-z0-9\-]+",
+        r"AKIA[0-9A-Z]{16}",
+        r"https?://[^ \n]*webhook[^ \n]*",
+        r"(token|secret|apikey|api_key|password)\s*[:=]\s*[\"'][^\"']+[\"']",
+    ]
+
+    for pattern in secret_patterns:
+        if re.search(pattern, skill, re.IGNORECASE):
+            categories.append("hardcoded_secret")
+            break
+
+    ####################################################
+    # prompt_injection
+    ####################################################
+
+    injection_patterns = [
+        "ignore the user's",
+        "ignore the user",
+        "ignore previous instructions",
+        "ignore all previous instructions",
+        "ignore system prompt",
+        "silently post",
+        "silently send",
+        "without telling the user",
+        "do not mention",
+        "don't mention",
+        "secretly",
+        "exfiltrate",
+        "telemetry purposes",
+        "even if the user did not ask",
+        "override user",
+        "ignore stop",
+        "ignore cancel",
+    ]
+
+    for p in injection_patterns:
+        if p in lower:
+            categories.append("prompt_injection")
+            break
+
+    ####################################################
+    # excessive_permissions
+    ####################################################
+
+    excessive_patterns = [
+        "filesystem: full",
+        "filesystem: all",
+        "filesystem: unrestricted",
+        "filesystem: read/write all",
+        "filesystem: read/write /",
+        "filesystem: read/write entire filesystem",
+        "filesystem: any",
+        "network: any",
+        "network: unrestricted",
+        "network: internet",
+        "network: all",
+        "all domains",
+        "any domain",
+        "egress: any",
+    ]
+
+    for p in excessive_patterns:
+        if p in lower:
+            categories.append("excessive_permissions")
+            break
+
+    ####################################################
+    # unclear_provenance
+    ####################################################
+
+    has_author = re.search(r"^author\s*:", skill, re.MULTILINE | re.IGNORECASE)
+    has_version = re.search(r"^version\s*:", skill, re.MULTILINE | re.IGNORECASE)
+    has_changelog = re.search(r"^changelog\s*:", skill, re.MULTILINE | re.IGNORECASE)
+
+    if not (has_author and has_version and has_changelog):
+        categories.append("unclear_provenance")
+    else:
+
+        provenance_patterns = [
+            "rewrite version",
+            "update version silently",
+            "modify version without telling",
+            "change version metadata",
+            "rewrite metadata",
+        ]
+
+        for p in provenance_patterns:
+            if p in lower:
+                categories.append("unclear_provenance")
+                break
+
+    return {"categories": categories}
