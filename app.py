@@ -12,7 +12,7 @@ import json
 import requests
 import ipaddress
 import socket
-
+from contextlib import asynccontextmanager
 
 from pathlib import Path
 
@@ -37,8 +37,12 @@ def setup_files():
         "SAFE_ENCODED_8d2b646664a3092814faa087"
     )
 
-setup_files()
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_files()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 
 class ChargeRequest(BaseModel):
@@ -516,6 +520,8 @@ def run_guard(req: RunRequest):
     ####################################################
 
     return cont("Budget available and no loop detected.")
+
+# Question-8
 
 SANDBOX = Path("/srv/agent-redteam/sandbox-e597b46a80").resolve()
 
