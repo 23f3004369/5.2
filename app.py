@@ -9,7 +9,7 @@ import re
 import shlex
 from typing import Any, Dict, List
 import json
-import requests
+import httpx
 import ipaddress
 import socket
 from contextlib import asynccontextmanager
@@ -582,32 +582,102 @@ def resolve_in_sandbox(path):
     return None
 
 
-def host_is_safe(host):
+def has_forbidden_url_character(raw_url):
+    """
+    urllib.parse strips leading C0 controls/spaces and removes tabs and
+    newlines before parsing. Reject them first so validation and the HTTP
+    client's parser can never disagree about the effective URL.
+    """
 
-    if host not in ALLOWED_HOSTS:
-        return False
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw_url):
+        return True
+
+    if "\\" in raw_url:
+        return True
+
+    return False
+
+
+def validate_url(raw_url):
+    """
+    Returns (ok, reason). Accepts only exact http/https URLs to an
+    allowlisted host on its default port, with a canonical authority and
+    globally routable DNS answers.
+    """
+
+    if not isinstance(raw_url, str) or not raw_url:
+        return False, "URL must be a non-empty string"
+
+    if len(raw_url) > 4096 or has_forbidden_url_character(raw_url):
+        return False, "URL contains forbidden characters"
 
     try:
+        parsed = urlparse(raw_url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname.lower() if parsed.hostname else ""
+        port = parsed.port
+    except (ValueError, UnicodeError):
+        return False, "URL could not be parsed safely"
 
-        infos = socket.getaddrinfo(host, None)
+    if scheme not in ("http", "https"):
+        return False, "only HTTP and HTTPS are allowed"
 
-        for info in infos:
+    if not parsed.netloc or not host:
+        return False, "URL must contain a hostname"
 
-            ip = ipaddress.ip_address(info[4][0])
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+    ):
+        return False, "userinfo is not allowed in URLs"
 
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
-            ):
-                return False
+    if host not in ALLOWED_HOSTS:
+        return False, "hostname is not on the exact allowlist"
 
-    except Exception:
-        return False
+    expected_authority = host if port is None else "{}:{}".format(host, port)
 
-    return True
+    if parsed.netloc.lower() != expected_authority:
+        return False, "URL authority is not canonical"
+
+    default_port = 443 if scheme == "https" else 80
+
+    if port is not None and port != default_port:
+        return False, "non-default ports are not allowed"
+
+    try:
+        client_url = httpx.URL(raw_url)
+    except (httpx.InvalidURL, UnicodeError, ValueError):
+        return False, "HTTP client rejected the URL syntax"
+
+    if (
+        client_url.scheme.lower() != scheme
+        or client_url.host.lower() != host
+        or (client_url.port is not None and client_url.port != default_port)
+    ):
+        return False, "URL parsers disagree about the destination"
+
+    try:
+        infos = socket.getaddrinfo(host, port or default_port, type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError):
+        return False, "hostname did not resolve"
+
+    addresses = {info[4][0].split("%", 1)[0] for info in infos}
+
+    if not addresses:
+        return False, "hostname returned no addresses"
+
+    for address in addresses:
+
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False, "DNS returned an invalid address"
+
+        if not ip.is_global:
+            return False, "DNS resolved to a non-public address"
+
+    return True, "URL is allowed"
 
 
 @app.post("/check2")
@@ -640,44 +710,70 @@ def check(req: RequestModel):
 
         try:
 
-            for _ in range(3):
+            with httpx.Client(
+                follow_redirects=False,
+                timeout=httpx.Timeout(12.0, connect=5.0),
+                trust_env=False,
+                headers={"User-Agent": "guardrail/1.0", "Accept": "*/*"},
+            ) as client:
 
-                parsed = urlparse(url)
+                for _ in range(6):
 
-                if parsed.username or parsed.password:
-                    return block("userinfo not allowed")
+                    ok, reason = validate_url(url)
 
-                host = parsed.hostname
+                    if not ok:
+                        return block(reason)
 
-                if not host_is_safe(host):
-                    return block("host blocked")
+                    try:
 
-                r = requests.get(
-                    url,
-                    timeout=5,
-                    allow_redirects=False,
-                )
+                        with client.stream("GET", url) as r:
 
-                if 300 <= r.status_code < 400:
+                            if r.status_code in (301, 302, 303, 307, 308):
 
-                    location = r.headers.get("Location", "")
+                                location = r.headers.get("Location", "")
 
-                    target = urlparse(urljoin(url, location))
+                                if not location:
+                                    return block("redirect without Location")
 
-                    if target.username or target.password:
-                        return block("redirect target userinfo not allowed")
+                                next_url = urljoin(url, location)
 
-                    if not host_is_safe(target.hostname):
-                        return block("redirect target host blocked")
+                                ok, reason = validate_url(next_url)
 
-                    url = urljoin(url, location)
-                    continue
+                                if not ok:
+                                    return block("redirect target blocked")
 
-                return allow(r.text, "Fetch allowed")
+                                url = next_url
+                                continue
 
-            return block("Too many redirects")
+                            body = bytearray()
 
-        except Exception as e:
-            return block(str(e))
+                            for chunk in r.iter_bytes():
+
+                                body.extend(chunk)
+
+                                if len(body) > 1_000_000:
+                                    return block("response body too large")
+
+                            return allow(
+                                body.decode("utf-8", errors="replace"),
+                                "Fetch allowed",
+                            )
+
+                    except (
+                        httpx.InvalidURL,
+                        httpx.UnsupportedProtocol,
+                        httpx.LocalProtocolError,
+                    ):
+                        return block("invalid URL")
+                    except httpx.HTTPError:
+                        return allow(
+                            "fetch was allowed but the remote request failed",
+                            "Fetch allowed",
+                        )
+
+                return block("Too many redirects")
+
+        finally:
+            pass
 
     return block("Unknown tool")
