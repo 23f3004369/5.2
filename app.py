@@ -722,7 +722,9 @@ def _looks_like_ip_literal(s):
     """
     True for decimal/hex/octal IP-literal spellings that getaddrinfo can
     decode (e.g. 0x7f000001, 2130706433, 0177.0.0.1, 127.1). Small bare
-    numbers like "1" are excluded so benign numeric query values pass.
+    numbers like "2026" or "8080" are excluded so benign numeric query
+    values pass; only dotted forms and values large enough to be a real
+    single-component IPv4 address are treated as IPs.
     """
 
     if not s:
@@ -739,8 +741,12 @@ def _looks_like_ip_literal(s):
     if t.startswith("0x"):
         return True
 
-    if len(s) >= 4 and s.isdigit():
-        return True
+    if s.isdigit():
+
+        try:
+            return int(s) >= 0x1000000
+        except ValueError:
+            return False
 
     return False
 
