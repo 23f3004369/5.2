@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qs
 from pathlib import Path
 import base64
 import os
@@ -598,6 +598,139 @@ def has_forbidden_url_character(raw_url):
     return False
 
 
+PRIVATE_HOSTNAMES = {
+    "localhost",
+    "localhost.localdomain",
+    "metadata",
+    "metadata.google.internal",
+    "metadata.google",
+    "metadata.google.internal.google",
+}
+
+
+def _value_carries_internal_target(value):
+    """
+    True when a query/fragment value encodes an internal target: a full URL
+    to a non-allowlisted host, a private/loopback/link-local/metadata IP, or
+    a localhost/metadata-style hostname.
+    """
+
+    v = value.strip()
+    if not v:
+        return False
+
+    lower = v.lower()
+
+    if lower.startswith(("http://", "https://")):
+
+        inner = urlparse(v)
+        h = (inner.hostname or "").lower()
+
+        if not h:
+            return True
+
+        return h not in ALLOWED_HOSTS
+
+    if v.startswith("//"):
+
+        inner = urlparse("http:" + v)
+        h = (inner.hostname or "").lower()
+
+        if not h:
+            return True
+
+        return h not in ALLOWED_HOSTS
+
+    hostpart = v.split(":", 1)[0].split("/", 1)[0].split("?", 1)[0]
+
+    if hostpart.lower() in PRIVATE_HOSTNAMES:
+        return True
+
+    try:
+        ip = ipaddress.ip_address(hostpart)
+        return not ip.is_global
+    except ValueError:
+        pass
+
+    if not _looks_like_ip_literal(hostpart):
+        return False
+
+    try:
+        infos = socket.getaddrinfo(hostpart, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError):
+        return False
+
+    for info in infos:
+
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        except ValueError:
+            return False
+
+        if not ip.is_global:
+            return True
+
+    return False
+
+
+def _looks_like_ip_literal(s):
+    """
+    True for decimal/hex/octal IP-literal spellings that getaddrinfo can
+    decode (e.g. 0x7f000001, 2130706433, 0177.0.0.1, 127.1). Small bare
+    numbers like "1" are excluded so benign numeric query values pass.
+    """
+
+    if not s:
+        return False
+
+    if not all(ch.isalnum() or ch in ".xX" for ch in s):
+        return False
+
+    if "." in s:
+        return True
+
+    t = s.lower()
+
+    if t.startswith("0x"):
+        return True
+
+    if len(s) >= 4 and s.isdigit():
+        return True
+
+    return False
+
+
+def _url_carries_internal_target(parsed):
+    """
+    An allowed host alone is not enough: a redirect/open-redirect parameter
+    (e.g. ?next=, ?url=) can carry a private or metadata destination. Inspect
+    the query string and fragment for such embedded targets.
+    """
+
+    for vals in parse_qs(parsed.query).values():
+
+        for v in vals:
+
+            if _value_carries_internal_target(v):
+                return True
+
+    fragment = parsed.fragment
+
+    if fragment:
+
+        if _value_carries_internal_target(fragment):
+            return True
+
+        if "@" in fragment:
+
+            tail = fragment.rsplit("@", 1)[1]
+
+            if _value_carries_internal_target(tail):
+                return True
+
+    return False
+
+
 def validate_url(raw_url):
     """
     Returns (ok, reason). Accepts only exact http/https URLs to an
@@ -634,6 +767,9 @@ def validate_url(raw_url):
 
     if host not in ALLOWED_HOSTS:
         return False, "hostname is not on the exact allowlist"
+
+    if _url_carries_internal_target(parsed):
+        return False, "URL parameter carries an internal target"
 
     expected_authority = host if port is None else "{}:{}".format(host, port)
 
