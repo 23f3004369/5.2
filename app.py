@@ -640,14 +640,52 @@ def _hostpart(value):
     return v
 
 
+def _host_is_internal(h):
+    """
+    True when a hostname/address is an internal target: localhost/metadata
+    hostnames, private/loopback/link-local/metadata IPs, or IP-literal
+    spellings that resolve to a non-global address. Public hostnames such as
+    google.com are NOT internal even though they are not allowlisted.
+    """
+
+    if h in PRIVATE_HOSTNAMES:
+        return True
+
+    try:
+        ip = ipaddress.ip_address(h)
+        return not ip.is_global
+    except ValueError:
+        pass
+
+    if not _looks_like_ip_literal(h):
+        return False
+
+    try:
+        infos = socket.getaddrinfo(h, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError):
+        return False
+
+    for info in infos:
+
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        except ValueError:
+            return False
+
+        if not ip.is_global:
+            return True
+
+    return False
+
+
 def _value_carries_internal_target(value, depth=0):
     """
     True when a query/fragment value encodes an internal target: a full URL
-    to a non-allowlisted host, a private/loopback/link-local/metadata IP, a
+    to an internal host, a private/loopback/link-local/metadata IP, a
     localhost/metadata-style hostname, or userinfo-confusion (a private IP
-    tucked into the userinfo slot of an otherwise-allowed URL). Full URLs to
-    an allowed host are inspected recursively so nested redirect parameters
-    are caught.
+    tucked into the userinfo slot of a URL). Full URLs to an allowed host are
+    inspected recursively so nested redirect parameters are caught. Public
+    hosts in query values (e.g. ?ref=http://google.com/) are left alone.
     """
 
     v = value.strip()
@@ -664,7 +702,7 @@ def _value_carries_internal_target(value, depth=0):
         if not h:
             return True
 
-        if h not in ALLOWED_HOSTS:
+        if _host_is_internal(h):
             return True
 
         for user in (inner.username, inner.password):
@@ -684,7 +722,7 @@ def _value_carries_internal_target(value, depth=0):
         if not h:
             return True
 
-        return h not in ALLOWED_HOSTS
+        return _host_is_internal(h)
 
     hostpart = _hostpart(v)
 
