@@ -608,11 +608,46 @@ PRIVATE_HOSTNAMES = {
 }
 
 
-def _value_carries_internal_target(value):
+def _hostpart(value):
+    """
+    Extract the host portion of a bare host/IP-style value, tolerating IPv6
+    brackets, ports, and trailing paths/query strings.
+    """
+
+    v = value.strip()
+
+    if v.startswith("["):
+        end = v.find("]")
+        if end != -1:
+            return v[1:end]
+
+    if "://" in v:
+        v = v.split("://", 1)[1]
+
+    for sep in ("/", "?", "#"):
+        idx = v.find(sep)
+        if idx != -1:
+            v = v[:idx]
+
+    if v.startswith("["):
+        end = v.find("]")
+        if end != -1:
+            return v[1:end]
+
+    if v.count(":") == 1:
+        v = v.split(":", 1)[0]
+
+    return v
+
+
+def _value_carries_internal_target(value, depth=0):
     """
     True when a query/fragment value encodes an internal target: a full URL
-    to a non-allowlisted host, a private/loopback/link-local/metadata IP, or
-    a localhost/metadata-style hostname.
+    to a non-allowlisted host, a private/loopback/link-local/metadata IP, a
+    localhost/metadata-style hostname, or userinfo-confusion (a private IP
+    tucked into the userinfo slot of an otherwise-allowed URL). Full URLs to
+    an allowed host are inspected recursively so nested redirect parameters
+    are caught.
     """
 
     v = value.strip()
@@ -629,7 +664,17 @@ def _value_carries_internal_target(value):
         if not h:
             return True
 
-        return h not in ALLOWED_HOSTS
+        if h not in ALLOWED_HOSTS:
+            return True
+
+        for user in (inner.username, inner.password):
+            if user and _value_carries_internal_target(user):
+                return True
+
+        if depth < 4 and _url_carries_internal_target(inner, depth + 1):
+            return True
+
+        return False
 
     if v.startswith("//"):
 
@@ -641,7 +686,7 @@ def _value_carries_internal_target(value):
 
         return h not in ALLOWED_HOSTS
 
-    hostpart = v.split(":", 1)[0].split("/", 1)[0].split("?", 1)[0]
+    hostpart = _hostpart(v)
 
     if hostpart.lower() in PRIVATE_HOSTNAMES:
         return True
@@ -700,18 +745,22 @@ def _looks_like_ip_literal(s):
     return False
 
 
-def _url_carries_internal_target(parsed):
+def _url_carries_internal_target(parsed, depth=0):
     """
     An allowed host alone is not enough: a redirect/open-redirect parameter
     (e.g. ?next=, ?url=) can carry a private or metadata destination. Inspect
-    the query string and fragment for such embedded targets.
+    the query string and fragment for such embedded targets, recursing into
+    nested URLs up to a small depth.
     """
+
+    if depth > 4:
+        return False
 
     for vals in parse_qs(parsed.query).values():
 
         for v in vals:
 
-            if _value_carries_internal_target(v):
+            if _value_carries_internal_target(v, depth):
                 return True
 
     fragment = parsed.fragment
@@ -816,8 +865,28 @@ def validate_url(raw_url):
     return True, "URL is allowed"
 
 
+CAPTURED = []
+
+
 @app.post("/check2")
 def check(req: RequestModel):
+
+    decision = _check2(req)
+
+    CAPTURED.append({"body": req.model_dump(), "decision": decision})
+
+    if len(CAPTURED) > 500:
+        del CAPTURED[:-250]
+
+    return decision
+
+
+@app.get("/debug2")
+def debug2():
+    return {"count": len(CAPTURED), "captured": CAPTURED}
+
+
+def _check2(req: RequestModel):
 
     if req.tool == "read_file":
 
